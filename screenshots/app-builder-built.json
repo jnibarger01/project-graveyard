@@ -1,0 +1,37 @@
+{
+  "url": "http://127.0.0.1:8081/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Project Graveyard",
+      "hasCanvas": false,
+      "bodyTextLen": 3573,
+      "bodyTextHash": "3db24fd130267a0bfd029ffd362bbdb521f325ce9a465d49103dbb109f255ef3",
+      "bodyTextPrefix": "Project Graveyard Dashboard Projects Graveyard Queue Tonight Set",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/home/jacen/projects/project-graveyard/screenshots/app-builder-built.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Project Graveyard",
+      "hasCanvas": false,
+      "bodyTextLen": 3469,
+      "bodyTextHash": "5c0cf5b69812b5e1765b2d01fc30295f4cb84e2dca33bccb2c65805ba8d42e75",
+      "bodyTextPrefix": "Sample graveyard — decisions stay on this device.Sign in to save",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/home/jacen/projects/project-graveyard/screenshots/app-builder-built-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "verdictFile": "/home/jacen/projects/project-graveyard/screenshots/app-builder-built.json",
+  "divergesFromBaseline": false,
+  "baselineReasons": []
+}
