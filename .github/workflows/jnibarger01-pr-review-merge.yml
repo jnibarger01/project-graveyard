@@ -1,8 +1,22 @@
 name: Jace PR Review & Auto-Merge
 
+# Security model
+# - pull_request_target, schedule, and workflow_dispatch all run this file from
+#   the default branch, so a PR cannot edit the gate that judges it. The jobs
+#   never check out or execute PR code; they only read PR metadata through the
+#   API. Do NOT add a checkout of the PR head to this workflow.
+# - pull_request_review is deliberately not a trigger: it would run the PR's own
+#   copy of this file. Late Copilot reviews and resolved threads are picked up
+#   by the scheduled sweep instead.
+# - Any PR touching .github/** is never auto-merged (manual review only).
+# - Merges made with GITHUB_TOKEN do not trigger other workflows (e.g. a future
+#   `push: main` deploy). Use a GitHub App token here if that becomes needed.
+
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
+  schedule:
+    - cron: "17,47 * * * *"
   workflow_dispatch:
     inputs:
       pr_number:
@@ -10,30 +24,103 @@ on:
         required: true
         type: number
 
-permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-  checks: read
-  statuses: read
-  actions: read
+permissions: {}
 
-concurrency:
-  group: jace-pr-review-${{ github.event.pull_request.number || inputs.pr_number }}
-  cancel-in-progress: true
+env:
+  GATE_AUTHOR: jnibarger01
+  # Space-separated check-run names (from github-actions) that must be present
+  # and SUCCESS on the PR head. See ci.yml.
+  REQUIRED_CHECKS: verify
 
 jobs:
+  select:
+    name: Select PRs to evaluate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      prs: ${{ steps.select.outputs.prs }}
+      mode: ${{ steps.select.outputs.mode }}
+    steps:
+      - id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+          EVENT_AUTHOR: ${{ github.event.pull_request.user.login }}
+          EVENT_DRAFT: ${{ github.event.pull_request.draft }}
+          INPUT_PR: ${{ inputs.pr_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # mode=event: wait for review/checks (up to ~20 min) and fail the run on BLOCK.
+          # mode=sweep: evaluate once; waiting is silent and BLOCK does not fail the run
+          #             (the PR comment carries the state; avoids a red run every 30 min).
+          case "$EVENT_NAME" in
+            pull_request_target)
+              if [[ "$EVENT_AUTHOR" == "$GATE_AUTHOR" && "$EVENT_DRAFT" == "false" ]]; then
+                prs="[$EVENT_PR]"
+              else
+                prs="[]"
+              fi
+              mode=event
+              ;;
+            workflow_dispatch)
+              if [[ ! "$INPUT_PR" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Invalid pr_number: $INPUT_PR" >&2
+                exit 1
+              fi
+              prs="[$INPUT_PR]"
+              mode=event
+              ;;
+            schedule)
+              prs="$(gh pr list -R "$GITHUB_REPOSITORY" --state open --author "$GATE_AUTHOR" \
+                --limit 100 --json number,isDraft \
+                --jq '[.[] | select(.isDraft | not) | .number]')"
+              mode=sweep
+              ;;
+            *)
+              echo "Unsupported event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "Selected PRs ($mode): $prs"
+          echo "prs=$prs" >>"$GITHUB_OUTPUT"
+          echo "mode=$mode" >>"$GITHUB_OUTPUT"
+
   review-and-merge:
     name: PR review and merge gate
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.pull_request.user.login == 'jnibarger01' && github.event.pull_request.draft == false) }}
+    needs: select
+    if: ${{ needs.select.outputs.prs != '' && needs.select.outputs.prs != '[]' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      checks: read
+      statuses: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        pr: ${{ fromJSON(needs.select.outputs.prs) }}
+    # A new push cancels the in-flight evaluation of the old head. A sweep never
+    # cancels an event-driven run; it queues behind it instead.
+    concurrency:
+      group: jace-pr-review-${{ matrix.pr }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
     steps:
       - name: Review, gate, and merge
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          PR_NUMBER: ${{ matrix.pr }}
+          MODE: ${{ needs.select.outputs.mode }}
         shell: bash
         run: |
           set -euo pipefail
@@ -42,118 +129,146 @@ jobs:
           OWNER="${GITHUB_REPOSITORY%%/*}"
           REPO="${GITHUB_REPOSITORY#*/}"
           MARKER='<!-- jace-pr-review-gate -->'
+          if [[ "$MODE" == "sweep" ]]; then MAX_ATTEMPTS=1; else MAX_ATTEMPTS=40; fi
 
           upsert_comment() {
-            local body="$1"
-            local full
-            full="$MARKER"$'\n'"$body"
-            local id
-            id="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate               --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- jace-pr-review-gate -->"))) | .id'               | tail -n 1 || true)"
-            if [[ -n "$id" ]]; then
+            local full="$MARKER"$'\n'"$1"
+            local existing id old_body
+            existing="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+              --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- jace-pr-review-gate -->"))) | {id, body} | @json' \
+              | tail -n 1 || true)"
+            if [[ -n "$existing" ]]; then
+              id="$(jq -r '.id' <<<"$existing")"
+              old_body="$(jq -r '.body' <<<"$existing")"
+              # Sweeps re-evaluate every 30 min; don't churn an unchanged comment.
+              if [[ "$old_body" == "$full" ]]; then return 0; fi
               gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -f body="$full" >/dev/null
             else
               gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$full" >/dev/null
             fi
           }
 
-          pr_json="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
-          author="$(jq -r '.user.login' <<<"$pr_json")"
-          draft="$(jq -r '.draft' <<<"$pr_json")"
-
-          if [[ "$author" != "jnibarger01" ]]; then
-            echo "Ignoring PR #$PR: author is $author."
-            exit 0
-          fi
-
-          if [[ "$draft" == "true" ]]; then
-            echo "Ignoring PR #$PR while it is a draft."
-            exit 0
-          fi
-
-          policy_changes="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate \
-            --jq '.[] | select(.filename == ".github/workflows/jnibarger01-pr-review-merge.yml" or .filename == ".github/instructions/jnibarger01-pr-review.instructions.md") | .filename')"
-          if [[ -n "$policy_changes" ]]; then
-            upsert_comment "BLOCK — this PR changes the automated review/merge policy itself. Self-modifying gate changes require manual review and will not be auto-merged.
-
-            Files:
-            \`\`\`
-            $policy_changes
-            \`\`\`"
+          # block SUMMARY [DETAILS] — record why the PR was not merged, then stop.
+          block() {
+            local body="BLOCK — $1"
+            if [[ -n "${2:-}" ]]; then
+              body+=$'\n\n```\n'"$2"$'\n```'
+            fi
+            upsert_comment "$body"
+            echo "BLOCK: $1"
+            if [[ "$MODE" == "sweep" ]]; then exit 0; fi
             exit 1
-          fi
+          }
 
-          # Request a fresh Copilot review. This is the semantic review for
-          # correctness, security, regressions, scope, and test adequacy.
-          if ! review_request="$(gh pr edit "$PR" -R "$GITHUB_REPOSITORY" --add-reviewer @copilot 2>&1)"; then
-            upsert_comment "BLOCK — GitHub Copilot code review could not be requested. No merge was attempted.
-
-            Fix: enable Copilot code review for this repository/account, then re-run **Jace PR Review & Auto-Merge**.
-
-            Details: \`$review_request\`"
-            exit 1
-          fi
-
-          ready=false
-          last_reason="waiting for review/check state"
-
-          for attempt in $(seq 1 40); do
-            snapshot="$(gh api graphql               -f owner="$OWNER"               -f repo="$REPO"               -F number="$PR"               -f query='
-                query($owner: String!, $repo: String!, $number: Int!) {
-                  repository(owner: $owner, name: $repo) {
-                    pullRequest(number: $number) {
-                      state
-                      isDraft
-                      mergeable
-                      reviewDecision
-                      headRefOid
-                      reviews(last: 100) {
-                        nodes {
-                          author { login }
-                          state
-                          submittedAt
-                          commit { oid }
-                        }
+          fetch_snapshot() {
+            # shellcheck disable=SC2016 # GraphQL variables, not shell expansions.
+            gh api graphql -f owner="$OWNER" -f repo="$REPO" -F number="$PR" -f query='
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    state
+                    isDraft
+                    mergeable
+                    reviewDecision
+                    headRefOid
+                    reviews(last: 100) {
+                      nodes {
+                        author { login }
+                        state
+                        body
+                        url
+                        submittedAt
+                        commit { oid }
                       }
-                      reviewThreads(first: 100) {
-                        nodes {
-                          isResolved
-                          comments(first: 20) {
-                            nodes {
-                              author { login }
-                              body
-                              url
-                            }
+                    }
+                    reviewThreads(first: 100) {
+                      nodes {
+                        isResolved
+                        comments(first: 20) {
+                          nodes {
+                            author { login }
+                            body
+                            url
                           }
                         }
-                        pageInfo { hasNextPage }
                       }
-                      commits(last: 1) {
-                        nodes {
-                          commit {
-                            statusCheckRollup {
-                              contexts(first: 100) {
-                                nodes {
-                                  __typename
-                                  ... on CheckRun {
-                                    name
-                                    status
-                                    conclusion
-                                    app { slug }
-                                  }
-                                  ... on StatusContext {
-                                    context
-                                    state
-                                  }
+                      pageInfo { hasNextPage }
+                    }
+                    commits(last: 1) {
+                      nodes {
+                        commit {
+                          statusCheckRollup {
+                            contexts(first: 100) {
+                              nodes {
+                                __typename
+                                ... on CheckRun {
+                                  name
+                                  status
+                                  conclusion
+                                  app { slug }
                                 }
-                                pageInfo { hasNextPage }
+                                ... on StatusContext {
+                                  context
+                                  state
+                                }
                               }
+                              pageInfo { hasNextPage }
                             }
                           }
                         }
                       }
                     }
                   }
-                }')"
+                }
+              }'
+          }
+
+          # Copilot reviews submitted against the current head.
+          # shellcheck disable=SC2016 # jq variables, not shell expansions.
+          copilot_reviews_jq='
+            .data.repository.pullRequest as $pr
+            | [$pr.reviews.nodes[]
+               | select((.author.login // "" | startswith("copilot-pull-request-reviewer"))
+                        and (.commit.oid // "") == $pr.headRefOid)]'
+
+          pr_json="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
+          author="$(jq -r '.user.login' <<<"$pr_json")"
+          draft="$(jq -r '.draft' <<<"$pr_json")"
+          pr_state="$(jq -r '.state' <<<"$pr_json")"
+
+          if [[ "$author" != "$GATE_AUTHOR" ]]; then
+            echo "Ignoring PR #$PR: author is $author."
+            exit 0
+          fi
+          if [[ "$pr_state" != "open" || "$draft" == "true" ]]; then
+            echo "Ignoring PR #$PR: state=$pr_state draft=$draft."
+            exit 0
+          fi
+
+          # Anything under .github/ (this gate, its Copilot instructions, CI, other
+          # workflows) changes what protects main. Renames count on either side.
+          policy_changes="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate \
+            --jq '.[] | select((.filename | startswith(".github/")) or ((.previous_filename // "") | startswith(".github/"))) | .filename')"
+          if [[ -n "$policy_changes" ]]; then
+            block "this PR changes files under .github/ (CI or the review/merge policy). These changes require manual review and will not be auto-merged." "$policy_changes"
+          fi
+
+          # Request a Copilot review only when the current head has none, so sweeps
+          # and re-runs don't trigger duplicate reviews of the same commit.
+          snapshot="$(fetch_snapshot)"
+          if [[ "$(jq "$copilot_reviews_jq | length" <<<"$snapshot")" == "0" ]]; then
+            if ! review_request="$(gh pr edit "$PR" -R "$GITHUB_REPOSITORY" --add-reviewer @copilot 2>&1)"; then
+              block "GitHub Copilot code review could not be requested. No merge was attempted. Enable Copilot code review for this repository (or automatic review via a ruleset), then re-run **Jace PR Review & Auto-Merge**." "$review_request"
+            fi
+          fi
+
+          ready=false
+          last_reason="waiting for review/check state"
+
+          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+            if (( attempt > 1 )); then
+              snapshot="$(fetch_snapshot)"
+            fi
 
             state="$(jq -r '.data.repository.pullRequest.state' <<<"$snapshot")"
             is_draft="$(jq -r '.data.repository.pullRequest.isDraft' <<<"$snapshot")"
@@ -169,37 +284,58 @@ jobs:
             fi
 
             if [[ "$more_threads" == "true" || "$more_checks" == "true" ]]; then
-              upsert_comment "BLOCK — the PR has more than 100 review threads or status checks, which this gate will not truncate. No merge was attempted."
-              exit 1
+              block "the PR has more than 100 review threads or status checks, which this gate will not truncate. No merge was attempted."
             fi
 
             if [[ "$mergeable" == "CONFLICTING" ]]; then
-              upsert_comment "BLOCK — PR #$PR has merge conflicts. Resolve the conflicts and push the updated branch; the gate will run again."
-              exit 1
+              block "PR #$PR has merge conflicts. Resolve the conflicts and push the updated branch; the gate will run again."
             fi
 
             if [[ "$review_decision" == "CHANGES_REQUESTED" ]]; then
-              upsert_comment "BLOCK — at least one submitted review currently requests changes. Address the review and push/re-request review before merging."
-              exit 1
+              block "at least one submitted review currently requests changes. Address the review and push/re-request review before merging."
             fi
 
             unresolved="$(jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' <<<"$snapshot")"
             if (( unresolved > 0 )); then
-              upsert_comment "BLOCK — $unresolved review thread(s) remain unresolved. Resolve legitimate blocking findings before merging."
-              exit 1
+              block "$unresolved review thread(s) remain unresolved. Resolve legitimate blocking findings; the scheduled sweep (or a manual re-run) re-evaluates afterwards."
             fi
 
-            copilot_current="$(jq --arg sha "$head_sha" '
-              [.data.repository.pullRequest.reviews.nodes[]
-               | select((.author.login // "" | startswith("copilot-pull-request-reviewer"))
-                        and (.commit.oid // "") == $sha)]
-              | length' <<<"$snapshot")"
+            copilot_current="$(jq "$copilot_reviews_jq | length" <<<"$snapshot")"
+
+            # Copilot findings that can't be anchored to a line live in the review
+            # summary, which creates no thread. The instructions file tells Copilot
+            # to mark those with MERGE-BLOCKER.
+            copilot_blockers="$(jq -r "$copilot_reviews_jq | .[] | select((.body // \"\") | contains(\"MERGE-BLOCKER\")) | .url" <<<"$snapshot")"
+            if [[ -n "$copilot_blockers" ]]; then
+              block "the Copilot review of head $head_sha reports a MERGE-BLOCKER finding in its summary. Address it and push a new commit." "$copilot_blockers"
+            fi
+
+            # Required checks must exist (from GitHub Actions) and be SUCCESS.
+            # "Missing" matters: a PR with no CI at all must not merge.
+            required_status="$(jq -r --arg names "$REQUIRED_CHECKS" '
+              ($names | split(" ") | map(select(length > 0))) as $req
+              | [.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]?
+                 | select(.__typename == "CheckRun" and (.app.slug // "") == "github-actions")] as $runs
+              | [$req[] as $n
+                 | ($runs | map(select(.name == $n))) as $m
+                 | if ($m | length) == 0 then "missing:\($n)"
+                   elif any($m[]; .status != "COMPLETED") then "pending:\($n)"
+                   elif all($m[]; .conclusion == "SUCCESS") then empty
+                   else "failed:\($n)"
+                   end]
+              | join(" ")' <<<"$snapshot")"
+            required_failed="$(tr ' ' '\n' <<<"$required_status" | grep '^failed:' | cut -d: -f2- | paste -sd' ' || true)"
+            required_waiting="$(tr ' ' '\n' <<<"$required_status" | grep -E '^(missing|pending):' | paste -sd' ' || true)"
+
+            if [[ -n "$required_failed" ]]; then
+              block "required check(s) did not succeed on head $head_sha: $required_failed"
+            fi
 
             pending_checks="$(jq '
               [.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]?
                | select(
                    (.__typename == "CheckRun"
-                    and .name != "PR review and merge gate"
+                    and (.name | startswith("PR review and merge gate") | not)
                     and .status != "COMPLETED")
                    or
                    (.__typename == "StatusContext"
@@ -211,7 +347,7 @@ jobs:
               [.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]?
                | select(
                    (.__typename == "CheckRun"
-                    and .name != "PR review and merge gate"
+                    and (.name | startswith("PR review and merge gate") | not)
                     and .status == "COMPLETED"
                     and ((.conclusion // "") != "SUCCESS")
                     and ((.conclusion // "") != "NEUTRAL")
@@ -225,12 +361,13 @@ jobs:
               | length' <<<"$snapshot")"
 
             if (( failed_checks > 0 )); then
-              upsert_comment "BLOCK — $failed_checks status check(s) are failing/cancelled. All CI checks must be successful, neutral, or skipped before this automation will merge."
-              exit 1
+              block "$failed_checks status check(s) are failing/cancelled. All CI checks must be successful, neutral, or skipped before this automation will merge."
             fi
 
             if [[ "$mergeable" == "UNKNOWN" ]]; then
               last_reason="GitHub is still computing mergeability"
+            elif [[ -n "$required_waiting" ]]; then
+              last_reason="waiting for required check(s): $required_waiting"
             elif (( copilot_current == 0 )); then
               last_reason="waiting for a Copilot review of head $head_sha"
             elif (( pending_checks > 0 )); then
@@ -240,13 +377,16 @@ jobs:
               break
             fi
 
-            echo "Attempt $attempt/40: $last_reason"
-            sleep 30
+            echo "Attempt $attempt/$MAX_ATTEMPTS: $last_reason"
+            if (( attempt < MAX_ATTEMPTS )); then sleep 30; fi
           done
 
           if [[ "$ready" != "true" ]]; then
-            upsert_comment "BLOCK — timed out while $last_reason. No merge was attempted. Re-run **Jace PR Review & Auto-Merge** after the prerequisite completes."
-            exit 1
+            if [[ "$MODE" == "sweep" ]]; then
+              echo "Sweep: PR #$PR not ready ($last_reason); leaving it for the next pass."
+              exit 0
+            fi
+            block "timed out while $last_reason. No merge was attempted. The scheduled sweep re-evaluates every 30 minutes, or re-run **Jace PR Review & Auto-Merge** manually."
           fi
 
           # Re-read immediately before merge so a moved head cannot slip through.
@@ -254,8 +394,7 @@ jobs:
           final_head="$(jq -r '.head.sha' <<<"$final_pr")"
           final_mergeable="$(jq -r '.mergeable' <<<"$final_pr")"
           if [[ "$final_head" != "$head_sha" || "$final_mergeable" != "true" ]]; then
-            upsert_comment "BLOCK — PR state changed during review (head moved or GitHub no longer reports it mergeable). No merge was attempted."
-            exit 1
+            block "PR state changed during review (head moved or GitHub no longer reports it mergeable). No merge was attempted."
           fi
 
           repo_json="$(gh api "repos/$GITHUB_REPOSITORY")"
@@ -266,21 +405,20 @@ jobs:
           elif [[ "$(jq -r '.allow_rebase_merge' <<<"$repo_json")" == "true" ]]; then
             method="rebase"
           else
-            upsert_comment "BLOCK — repository settings expose no allowed pull-request merge method."
-            exit 1
+            block "repository settings expose no allowed pull-request merge method."
           fi
 
-          if ! merge_json="$(gh api               -H 'X-GitHub-Api-Version: 2026-03-10'               -X PUT "repos/$GITHUB_REPOSITORY/pulls/$PR/merge"               -f sha="$head_sha"               -f merge_method="$method"               -f merge_action=default 2>&1)"; then
-            upsert_comment "BLOCK — GitHub rejected the merge after the review gate passed. Repository protections were not bypassed.
-
-            Details: \`$merge_json\`"
-            exit 1
+          # `sha` pins the merge to the reviewed head; GitHub rejects it if the head moved.
+          if ! merge_json="$(gh api -X PUT "repos/$GITHUB_REPOSITORY/pulls/$PR/merge" \
+              -f sha="$head_sha" \
+              -f merge_method="$method" 2>&1)"; then
+            block "GitHub rejected the merge after the review gate passed. Repository protections were not bypassed." "$merge_json"
           fi
 
           if [[ "$(jq -r '.merged // false' <<<"$merge_json")" != "true" ]]; then
             message="$(jq -r '.message // "GitHub did not merge the pull request."' <<<"$merge_json")"
-            upsert_comment "BLOCK — GitHub did not merge PR #$PR: $message"
-            exit 1
+            block "GitHub did not merge PR #$PR." "$message"
           fi
 
-          echo "Merged PR #$PR using repository-allowed method: $method."
+          upsert_comment "PASS — merged head \`$head_sha\` using \`$method\` after Copilot review, required checks ($REQUIRED_CHECKS), and all other checks passed."
+          echo "Merged PR #$PR at $head_sha using repository-allowed method: $method."
