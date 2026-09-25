@@ -95,6 +95,22 @@ snapshot with the new `commit_sha`. Nothing overwrites prior verdicts, so
 - Built output ships PGLite's WASM assets into the Nitro function bundle
   (`scripts/grok-pglite-wasm.mjs`) so the fallback runs even in serverless.
 
+## Deploying to Vercel (self-managed)
+
+The Grok auth broker only accepts Grok-hosted callbacks, so a self-managed
+Vercel deploy uses the app's own email/password sign-in instead.
+
+| Variable | Value | Why |
+| --- | --- | --- |
+| `DATABASE_URL` | set by the Neon Marketplace integration | persistent Postgres; migrations run during `npm run build` |
+| `BETTER_AUTH_SECRET` | 32+ random bytes (e.g. `openssl rand -hex 32`) | signs sessions; must be stable across function instances |
+| `BETTER_AUTH_URL` | the deployment's public URL, e.g. `https://project-graveyard.vercel.app` | OAuth/cookie origin and trusted origin |
+| `AUTH_SIGNUP_ALLOWLIST` | comma-separated emails allowed to create an account | unset or empty = nobody can sign up (fail closed) |
+| `VITE_GROK_OAUTH` | `false` | hides the Google/X buttons that cannot work outside Grok hosting |
+
+Do not set `VITE_AUTH_ENABLED=false` together with `DATABASE_URL`: the server
+refuses the shared dev user against a real database by design.
+
 ## Tests
 
 `tests/*.test.ts` run under plain Node (type stripping) and cover the

@@ -7,4 +7,6 @@
  *
  * Do NOT edit `server.ts` for this — that file is frozen pre-wired config.
  */
-export const emailAndPasswordEnabled = false;
+// On: the Vercel deploy can't use the Grok broker (it only accepts Grok preview
+// hosts). Who may sign up is limited by AUTH_SIGNUP_ALLOWLIST (./signup-gate).
+export const emailAndPasswordEnabled = true;
